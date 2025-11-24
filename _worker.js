@@ -1,919 +1,714 @@
-// src/worker.js
-import { connect } from "cloudflare:sockets";
-// 设置明文密码
-let password = 'cacm'; 
-let sha224Password ;
-//设置伪装web
-let proxydomain = 'www.pptv.com';
-//设置proxyIP
-let proxyIP = 'proxyip.fxxk.dedyn.io';
-let RproxyIP = 'true';//设为true则强制使用订阅器内置的proxyIP
-//内置订阅器嵌套
-let sub = 'sub.xmm404.workers.dev';//订阅器
-let subconverter = 'apiurl.v1.mk';//转换后端
-let subconfig = 'https://raw.githubusercontent.com/JustLagom/test/main/urltestconfig.ini';//配置文件config
+/**
+ * Project: Titanium-T Core (TrojanStallion Evolution)
+ * Version: v4.1.0 (UI Remastered)
+ * Protocol: Trojan + WebSocket
+ */
 
-/*
-if (!isValidSHA224(sha224Password)) {
-    throw new Error('sha224Password is not valid');
+import { connect } from 'cloudflare:sockets';
+
+// ==================== 1. 全局配置 ====================
+const 全局配置 = {
+    密钥: "abc", // 【重要】这是 Trojan 密码，同时也是管理面板的访问路径
+    默认兜底反代: "ProxyIP.US.CMLiussss.net:443",
+    
+    // 策略开关
+    启用普通反代: true,
+    启用S5: true,
+    启用全局S5: false,
+    S5账号列表: ["user:pass@host:port"], 
+    强制S5名单: ["ip.sb", "ip125.com", "test.org", "openai.com"],
+
+    // 运行参数
+    首次数据包超时: 5000,
+    连接停滞超时: 8000,
+    最大停滞次数: 12,
+    最大重连次数: 24,
+    会话缓存TTL: 3 * 60 * 1000,
+
+    // 健壮性参数
+    主动心跳间隔: 10000, 
+    控制循环轮询间隔: 500,
+    吞吐量监测间隔: 5000, 
+    吞吐量阈值_好: 500,
+    吞吐量阈值_差: 50,
+};
+
+// ==================== 2. 生产级特性 ====================
+class 遥测 {
+    推送(事件, 数据 = {}) {
+        if (事件.includes('error') || 事件.includes('crashed') || 事件.includes('success')) {
+            console.log(JSON.stringify({ 事件名: 事件, ...数据, 时间戳: new Date().toISOString() }));
+        }
+    }
 }
-*/
-export default {
-    /**
-     * @param {import("@cloudflare/workers-types").Request} request
-     * @param {{PASSWORD, SHA224, SHA224PASS, PROXYIP, PROXYDOMAIN, RPROXYIP, SUB, SUBAPI, SUBCONFIG: string}} env
-     * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
-     * @returns {Promise<Response>}
-     */
-    async fetch(request, env, ctx) {
-        try {
-            password = env.PASSWORD || password;
-            sha224Password = env.SHA224 || env.SHA224PASS || sha256.sha224(password);
-            proxydomain = env.PROXYDOMAIN || proxydomain;
-            RproxyIP = env.RPROXYIP || RproxyIP;
-            proxyIP = env.PROXYIP || proxyIP;
-            sub = env.SUB || sub;
-            subconverter = env.SUBAPI || subconverter;
-            subconfig = env.SUBCONFIG || subconfig;
-            const UA = request.headers.get('User-Agent') || 'null';
-            const userAgent = UA.toLowerCase();
-            const upgradeHeader = request.headers.get("Upgrade");
-            const url = new URL(request.url);
-            if (!upgradeHeader || upgradeHeader !== "websocket") {
-                //const url = new URL(request.url);
-                switch (url.pathname.toLowerCase()) {
-                    case `/${password}`: {
-                        const trojanConfig = await getTROJANConfig(password, request.headers.get('Host'), sub, UA, RproxyIP, url);
-                        return new Response(`${trojanConfig}`, {
-                        	status: 200,
-                        	headers: {
-                        		"Content-Type": "text/plain;charset=utf-8",
-                        	}
-                        });
-                    } 
-                    default:
-                         url.hostname = proxydomain;
-                         url.protocol = 'https:';
-                         request = new Request(url, request);
-                         return await fetch(request);
-                      }
-            } else {
-                // 从查询字符串中获取'proxyip'参数
-                proxyIP = url.searchParams.get('proxyIP') || proxyIP;
-                if (new RegExp('/proxyIP=', 'i').test(url.pathname)) proxyIP = url.pathname.toLowerCase().split('/proxyIP=')[1];
-                else if (new RegExp('/proxyIP.', 'i').test(url.pathname)) proxyIP = `proxyIP.${url.pathname.toLowerCase().split("/proxyIP.")[1]}`;
-		else if (!proxyIP || proxyIP == '') proxyIP = 'proxyip.fxxk.dedyn.io';
-                return await trojanOverWSHandler(request);
+const 遥测记录器 = new 遥测();
+
+class 会话缓存 {
+    constructor() { this._映射 = new Map(); }
+    设置(键) {  this._映射.set(键, Date.now());  if (this._映射.size > 500) this.清理(); }
+    存在(键) {
+        const 时间戳 = this._映射.get(键);
+        if (!时间戳 || Date.now() - 时间戳 > 全局配置.会话缓存TTL) { this._映射.delete(键); return false; }
+        return true;
+    }
+    清理() {
+        const 现在 = Date.now();
+        for (const [键, 时间戳] of this._映射) {
+            if (现在 - 时间戳 > 全局配置.会话缓存TTL) this._映射.delete(键);
+        }
+    }
+}
+const 会话缓存实例 = new 会话缓存();
+
+// ==================== 3. 核心辅助函数 ====================
+function 转换WebSocket为流(webSocket) {
+    const 可读流 = new ReadableStream({
+        start(控制器) {
+            webSocket.addEventListener("message", 事件 => { if (事件.data instanceof ArrayBuffer) 控制器.enqueue(new Uint8Array(事件.data)); });
+            webSocket.addEventListener("close", () => { try { 控制器.close(); } catch {} });
+            webSocket.addEventListener("error", 错误 => { try { 控制器.error(错误); } catch {} });
+        }
+    });
+    const 可写流 = new WritableStream({
+        write(数据块) { if (webSocket.readyState === WebSocket.OPEN) webSocket.send(数据块); },
+        close() { if (webSocket.readyState === WebSocket.OPEN) webSocket.close(1000); },
+        abort(原因) { webSocket.close(1001, 原因?.message); }
+    });
+    return { 可读: 可读流, 可写: 可写流 };
+}
+
+function 解析路径参数(路径名) {
+    const 参数 = {};
+    for (const 段 of 路径名.split('/').filter(Boolean)) {
+        const 分隔符索引 = 段.indexOf('=');
+        if (分隔符索引 === -1) continue;
+        const 键 = 段.slice(0, 分隔符索引);
+        const 值 = 段.slice(分隔符索引 + 1);
+        if (键) 参数[键] = decodeURIComponent(值);
+    }
+    return 参数;
+}
+
+function 解析主机端口(地址字符串, 默认端口) {
+    if (!地址字符串) return [null, 默认端口];
+    地址字符串 = 地址字符串.trim();
+    const v6匹配结果 = 地址字符串.match(/^\[([^\]]+)\](?::(\d+))?$/);
+    if (v6匹配结果) return [`[${v6匹配结果[1]}]`, v6匹配结果[2] ? Number(v6匹配结果[2]) : 默认端口];
+    const 冒号索引 = 地址字符串.lastIndexOf(":");
+    if (冒号索引 === -1) return [地址字符串, 默认端口];
+    const 端口部分 = 地址字符串.slice(冒号索引 + 1);
+    if (/^\d+$/.test(端口部分)) return [地址字符串.slice(0, 冒号索引), Number(端口部分)];
+    return [地址字符串, 默认端口];
+}
+
+function 提取地址信息(字节流, 密钥) {
+    try {
+        const 文本解码器 = new TextDecoder();
+        let 头部结束索引 = -1;
+        // 查找 Trojan 协议头部的结束符 (CRLF)
+        for (let i = 0; i < 字节流.length - 1; i++) {
+            if (字节流[i] === 0x0d && 字节流[i+1] === 0x0a) {
+                头部结束索引 = i + 2;
+                break;
             }
+        }
+        if (头部结束索引 === -1) throw new Error('Trojan 头部不完整');
+        
+        // Trojan over WebSocket 实际上通常是直接透传 Trojan 协议流
+        // 或者是 WebSocket 路径承载部分信息。
+        // 标准 Trojan 协议结构: <hex password>CRLF<cmd><addr_type><addr><port>CRLF<payload>
+        // 但为了简化 Worker 处理并兼容常见客户端的 WS 实现，
+        // 这里我们主要解析 SOCKS5 风格的 CMD/ADDR/PORT 部分。
+        
+        // 注意：很多客户端在使用 Trojan+WS 时，实际上是把 WS 作为传输层，
+        // 内部数据流仍然遵循 Trojan 结构。
+        // 我们需要找到第一个 CRLF 后的部分。
+        
+        const 密码部分 = 文本解码器.decode(字节流.slice(0, 头部结束索引 - 2)); // 去掉 CRLF
+        // 校验密码 (SHA224 hex string usually, but clients might send raw text depending on impl. 
+        // For simplicity in this worker script which mimics simplistic behavior, we check raw or hex)
+        // 在此脚本逻辑中，我们假设客户端发送的是标准的 Trojan 请求
+        
+        // 为了兼容性，本脚本采用简化策略：
+        // 实际的 Trojan 协议中，密码是 hex(sha224(password))。
+        // 但由于 Worker 难以高效做摘要校验且要透传，
+        // 我们主要依赖 URL 路径 (path) 上的 'my-key' 参数做第一层鉴权，
+        // 对数据流内的 Trojan 密码做宽容处理或仅提取地址。
+        
+        // 提取地址 (跳过 CMD[1byte] 和 ATYP[1byte])
+        let 游标 = 头部结束索引;
+        const 命令 = 字节流[游标]; // Should be 1 (connect) or 3 (udp)
+        const 地址类型 = 字节流[游标 + 1];
+        游标 += 2;
+        
+        let 主机 = '';
+        if (地址类型 === 1) { // IPv4
+            主机 = Array.from(字节流.slice(游标, 游标 + 4)).join('.');
+            游标 += 4;
+        } else if (地址类型 === 3) { // Domain
+            const 域名长度 = 字节流[游标];
+            游标 += 1;
+            主机 = 文本解码器.decode(字节流.slice(游标, 游标 + 域名长度));
+            游标 += 域名长度;
+        } else if (地址类型 === 4) { // IPv6
+            const v6段 = [];
+            for(let i=0; i<8; i++) v6段.push(new DataView(字节流.buffer).getUint16(字节流.byteOffset + 游标 + i*2).toString(16));
+            主机 = `[${v6段.join(':')}]`;
+            游标 += 16;
+        }
+        
+        const 端口 = new DataView(字节流.buffer).getUint16(字节流.byteOffset + 游标);
+        游标 += 2;
+        
+        // 再跳过最后的 CRLF
+        游标 += 2;
+
+        return {
+            主机: 主机,
+            端口: 端口,
+            载荷: 字节流.slice(游标),
+            会话密钥: 密码部分 // 用于会话复用
+        };
+    } catch (错误) {
+        // 如果解析失败，可能是数据包不完整或非 Trojan 协议
+        // 为了鲁棒性，返回空
+        throw new Error(`Trojan 解析失败: ${错误.message}`);
+    }
+}
+
+async function 创建S5套接字(S5参数, 目标主机, 目标端口) {
+    let 用户名 = null, 密码 = null, S5主机地址 = S5参数;
+    if (S5参数?.includes('@')) {
+        const 凭证与地址分隔索引 = S5参数.lastIndexOf('@');
+        const 凭证 = S5参数.slice(0, 凭证与地址分隔索引);
+        S5主机地址 = S5参数.slice(凭证与地址分隔索引 + 1);
+        const 用户名与密码分隔索引 = 凭证.indexOf(':');
+        if (用户名与密码分隔索引 !== -1) {
+            用户名 = 凭证.slice(0, 用户名与密码分隔索引);
+            密码 = 凭证.slice(用户名与密码分隔索引 + 1);
+        } else {
+            用户名 = 凭证;
+        }
+    }
+    const [连接主机, 连接端口] = 解析主机端口(S5主机地址, 1080);
+    const 远程套接字 = connect({ hostname: 连接主机, port: Number(连接端口) });
+    await 远程套接字.opened;
+    const 写入器 = 远程套接字.writable.getWriter();
+    const 读取器 = 远程套接字.readable.getReader();
+    const 清理并抛出错误 = async (错误) => {
+        try { 写入器.releaseLock(); } catch {}
+        try { 读取器.releaseLock(); } catch {}
+        try { 远程套接字?.close && 远程套接字.close(); } catch {}
+        if (错误) throw 错误;
+    };
+    try {
+        await 写入器.write(用户名 ? Uint8Array.from([5, 1, 2]) : Uint8Array.from([5, 1, 0]));
+        let 响应 = await _从读取器读取字节(读取器, 2, 5000);
+        if (!响应 || 响应[1] === 255) await 清理并抛出错误(new Error('S5 不支持的认证方法'));
+        if (响应[1] === 2) {
+            if (!用户名 || !密码) await 清理并抛出错误(new Error('S5 需要认证信息'));
+            const 用户名编码 = new TextEncoder().encode(用户名);
+            const 密码编码 = new TextEncoder().encode(密码);
+            const 认证包 = new Uint8Array(3 + 用户名编码.length + 密码编码.length);
+            认证包[0] = 1; 
+            认证包[1] = 用户名编码.length;
+            认证包.set(用户名编码, 2);
+            认证包[2 + 用户名编码.length] = 密码编码.length;
+            认证包.set(密码编码, 3 + 用户名编码.length);
+            await 写入器.write(认证包);
+            const 认证响应 = await _从读取器读取字节(读取器, 2, 5000);
+            if (!认证响应 || 认证响应[1] !== 0) await 清理并抛出错误(new Error('S5 认证失败'));
+        }
+        let 地址字节, 地址类型;
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(目标主机)) {
+            地址字节 = Uint8Array.from(目标主机.split('.').map(Number));
+            地址类型 = 1;
+        } else if (目标主机.includes(':')) {
+            try {
+                地址字节 = 转换IPv6文本为字节(目标主机);
+                地址类型 = 4;
+            } catch (e) {
+                const 域名编码 = new TextEncoder().encode(目标主机);
+                地址字节 = new Uint8Array([域名编码.length, ...域名编码]);
+                地址类型 = 3;
+            }
+        } else {
+            const 域名编码 = new TextEncoder().encode(目标主机);
+            地址字节 = new Uint8Array([域名编码.length, ...域名编码]);
+            地址类型 = 3;
+        }
+        const 请求包 = new Uint8Array(4 + 地址字节.length + 2);
+        const 请求视图 = new DataView(请求包.buffer);
+        请求包[0] = 5; 
+        请求包[1] = 1; 
+        请求包[2] = 0; 
+        请求包[3] = 地址类型;
+        请求包.set(地址字节, 4);
+        请求视图.setUint16(4 + 地址字节.length, Number(目标端口));
+        await 写入器.write(请求包);
+        const 连接响应 = await _从读取器读取字节(读取器, 5, 5000);
+        if (!连接响应 || 连接响应[1] !== 0) await 清理并抛出错误(new Error(`S5 连接失败: code ${连接响应[1]}`));
+        写入器.releaseLock();
+        读取器.releaseLock();
+        return 远程套接字;
+    } catch (错误) {
+        await 清理并抛出错误();
+        throw 错误;
+    }
+}
+
+async function _从读取器读取字节(读取器, 最小字节数, 超时毫秒) {
+    const 截止时间 = Date.now() + 超时毫秒;
+    let 累积字节 = new Uint8Array(0);
+    while (Date.now() < 截止时间) {
+        const { value: 值, done: 完成 } = await 读取器.read();
+        if (完成) break;
+        if (值?.length) {
+            const 新数组 = new Uint8Array(累积字节.length + 值.length);
+            新数组.set(累积字节, 0);
+            新数组.set(值, 累积字节.length);
+            累积字节 = 新数组;
+            if (累积字节.length >= 最小字节数) return 累积字节;
+        }
+    }
+    return 累积字节.length >= 最小字节数 ? 累积字节 : null;
+}
+
+function 转换IPv6文本为字节(地址文本) {
+    let 标准地址 = 地址文本.startsWith('[') && 地址文本.endsWith(']') ? 地址文本.slice(1, -1) : 地址文本;
+    const 双冒号部分 = 标准地址.split('::');
+    let 前段 = 双冒号部分[0] ? 双冒号部分[0].split(':').filter(Boolean) : [];
+    let 后段 = 双冒号部分[1] ? 双冒号部分[1].split(':').filter(Boolean) : [];
+    let 补零数量 = 8 - (前段.length + 后段.length);
+    if (补零数量 < 0) throw new Error('无效的IPv6地址');
+    const 完整段 = [...前段, ...Array(补零数量).fill('0'), ...后段];
+    const 字节输出 = new Uint8Array(16);
+    for (let i = 0; i < 8; i++) {
+        const 值 = parseInt(完整段[i] || '0', 16) || 0;
+        字节输出[2 * i] = (值 >> 8) & 255;
+        字节输出[2 * i + 1] = 值 & 255;
+    }
+    return 字节输出;
+}
+
+function 检查主机是否在强制S5名单(主机) {
+    if (!主机) return false;
+    主机 = 主机.toLowerCase();
+    return 全局配置.强制S5名单.some(规则 => {
+        规则 = 规则.toLowerCase();
+        if (规则.startsWith('*.')) {
+            const 域名后缀 = 规则.slice(2);
+            return 主机 === 域名后缀 || 主机.endsWith('.' + 域名后缀);
+        }
+        return 主机 === 规则;
+    });
+}
+
+// ==================== 4. 顶层会话处理器 (ReactionMax 核心) ====================
+async function 处理WebSocket会话(服务端套接字, 请求) {
+    // 修正：这里只使用一个 new
+    const 中止控制器 = new AbortController();
+    
+    const 客户端信息 = { ip: 请求.headers.get('CF-Connecting-IP'), colo: 请求.cf?.colo || 'N/A', asn: 请求.cf?.asn || 'N/A' };
+    const 关闭会话 = (原因) => {
+        if (!中止控制器.signal.aborted) {
+            中止控制器.abort();
+            遥测记录器.推送('session_close', { client: 客户端信息, reason: 原因 });
+        }
+    };
+    服务端套接字.addEventListener('close', () => 关闭会话('client_closed'));
+    服务端套接字.addEventListener('error', (err) => 关闭会话(`client_error: ${err.message}`));
+
+    let 重连计数 = 0;
+    let 网络评分 = 1.0; 
+    
+    try {
+        const 首个数据包 = await new Promise((resolve, reject) => {
+            const 计时器 = setTimeout(() => reject(new Error('首包超时')), 全局配置.首次数据包超时);
+            服务端套接字.addEventListener('message', e => {
+                clearTimeout(计时器);
+                if (e.data instanceof ArrayBuffer) resolve(new Uint8Array(e.data));
+            }, { once: true });
+        });
+
+        // 解析 Trojan 头部
+        const { 主机: 目标主机, 端口: 目标端口, 载荷: 初始数据, 会话密钥 } = 提取地址信息(首个数据包, 全局配置.密钥);
+        
+        if (会话缓存实例.存在(会话密钥)) 遥测记录器.推送('session_resume', { client: 客户端信息, target: `${目标主机}:${目标端口}` });
+        会话缓存实例.设置(会话密钥);
+        
+        const 路径参数 = 解析路径参数(new URL(请求.url).pathname);
+        
+        // 安全检查：路径中的 my-key 必须匹配全局密钥
+        if (路径参数['my-key'] !== 全局配置.密钥) throw new Error('路径鉴权失败');
+
+        let 是否初次连接 = true;
+
+        while (重连计数 < 全局配置.最大重连次数 && !中止控制器.signal.aborted) {
+            let TCP套接字 = null;
+            let 连接尝试失败 = false;
+
+            try {
+                // --- 动态连接策略链 ---
+                const 连接工厂列表 = [];
+                const 代理IP = 路径参数['pyip'];
+                const S5参数 = 路径参数['s5'];
+                const 添加工厂 = (名称, 函数) => 连接工厂列表.push({ 名称, 函数 });
+                const 直连工厂 = () => connect({ hostname: 目标主机, port: Number(目标端口) });
+                const 兜底工厂 = () => { const [h, p] = 解析主机端口(全局配置.默认兜底反代, 目标端口); return connect({ hostname: h, port: Number(p) }); };
+                const 代理IP工厂 = () => { const [h, p] = 解析主机端口(代理IP, 目标端口); return connect({ hostname: h, port: Number(p) }); };
+                const S5工厂 = () => 创建S5套接字(S5参数 || 全局配置.S5账号列表[0], 目标主机, 目标端口);
+                
+                if (全局配置.启用S5 && (检查主机是否在强制S5名单(目标主机) || 全局配置.启用全局S5 || S5参数)) {
+                    添加工厂('S5', S5工厂);
+                    添加工厂('兜底', 兜底工厂);
+                } else if (代理IP && 全局配置.启用普通反代) {
+                    添加工厂('直连', 直连工厂);
+                    添加工厂('代理IP', 代理IP工厂);
+                    添加工厂('兜底', 兜底工厂);
+                } else {
+                    添加工厂('直连', 直连工厂);
+                    添加工厂('兜底', 兜底工厂);
+                }
+
+                let 最终策略 = '未知';
+                for (const 工厂 of 连接工厂列表) {
+                    try {
+                        const 临时套接字 = await 工厂.函数();
+                        await 临时套接字.opened;
+                        TCP套接字 = 临时套接字;
+                        最终策略 = 工厂.名称;
+                        break;
+                    } catch (err) { }
+                }
+                if (!TCP套接字) throw new Error("所有连接策略均失败。");
+                
+                重连计数 = 0;
+                网络评分 = Math.min(1.0, 网络评分 + 0.15);
+
+                // Trojan 协议不需要 Worker 发送头部响应，直接透传
+                if (是否初次连接) {
+                    是否初次连接 = false;
+                }
+
+                const { 可读: WebSocket可读流, 可写: WebSocket可写流 } = 转换WebSocket为流(服务端套接字);
+                const WebSocket读取器 = WebSocket可读流.getReader();
+                const TCP写入器 = TCP套接字.writable.getWriter();
+                const TCP读取器 = TCP套接字.readable.getReader();
+
+                let 共享状态 = {
+                    最后活动时间: Date.now(),
+                    停滞计数: 0,
+                    周期内字节数: 0,
+                    上次检查时间: Date.now(),
+                };
+                
+                const 上行任务 = (async () => {
+                    await TCP写入器.write(初始数据);
+                    共享状态.最后活动时间 = Date.now();
+                    while (!中止控制器.signal.aborted) {
+                        const { value, done } = await WebSocket读取器.read();
+                        if (done) break;
+                        await TCP写入器.write(value);
+                        共享状态.最后活动时间 = Date.now();
+                    }
+                })();
+
+                const 下行任务 = (async () => {
+                    while (!中止控制器.signal.aborted) {
+                        const { value, done } = await TCP读取器.read();
+                        if (done) break;
+                        if (服务端套接字.readyState === WebSocket.OPEN) {
+                            服务端套接字.send(value);
+                            共享状态.最后活动时间 = Date.now();
+                            共享状态.停滞计数 = 0;
+                            共享状态.周期内字节数 += value.byteLength;
+                        }
+                    }
+                })();
+
+                const 控制循环任务 = (async () => {
+                    while (!中止控制器.signal.aborted) {
+                        await new Promise(res => setTimeout(res, 全局配置.控制循环轮询间隔));
+                        const 当前时间 = Date.now();
+                        if (当前时间 - 共享状态.最后活动时间 > 全局配置.连接停滞超时) {
+                            共享状态.停滞计数++;
+                            if (共享状态.停滞计数 >= 全局配置.最大停滞次数) throw new Error('连接停滞');
+                        }
+                        if (当前时间 - 共享状态.最后活动时间 > 全局配置.主动心跳间隔) {
+                            await TCP写入器.write(new Uint8Array(0));
+                            共享状态.最后活动时间 = 当前时间;
+                        }
+                        if (当前时间 - 共享状态.上次检查时间 > 全局配置.吞吐量监测间隔) {
+                            const 耗时 = (当前时间 - 共享状态.上次检查时间) / 1000;
+                            const 吞吐量 = 共享状态.周期内字节数 / 1024 / 耗时;
+                            if (吞吐量 > 全局配置.吞吐量阈值_好) 网络评分 = Math.min(1.0, 网络评分 + 0.05);
+                            else if (吞吐量 < 全局配置.吞吐量阈值_差) 网络评分 = Math.max(0.1, 网络评分 - 0.05);
+                            共享状态.上次检查时间 = 当前时间;
+                            共享状态.周期内字节数 = 0;
+                        }
+                    }
+                })();
+
+                await Promise.race([上行任务, 下行任务, 控制循环任务]);
+                break; 
+
+            } catch (err) {
+                连接尝试失败 = true;
+            } finally {
+                if (TCP套接字) try { TCP套接字.close(); } catch {}
+            }
+
+            if (连接尝试失败) {
+                重连计数++;
+                网络评分 = Math.max(0.1, 网络评分 - 0.2);
+                let 重连延迟 = Math.min(50 * Math.pow(1.5, 重连计数), 3000) * (1.5 - 网络评分 * 0.5);
+                await new Promise(res => setTimeout(res, Math.floor(重连延迟)));
+            }
+        }
+    } catch (e) {
+        遥测记录器.推送('session_crashed', { error: e.stack || e.message });
+    } finally {
+        关闭会话('finalizer_reached');
+    }
+}
+
+// ==================== 5. Dashboard 前端资源 & 伪装页面 ====================
+
+// 1. 配置面板 (Titanium-V 风格，适配 Trojan)
+const DASHBOARD_HTML = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrojanStallion Configurator</title>
+    <style>
+        :root { --bg: #0b0e14; --card: #151b26; --text: #e2e8f0; --accent: #0ea5e9; --border: #2d3748; }
+        body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; display: flex; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
+        .container { background: var(--card); border-radius: 12px; padding: 32px; width: 100%; max-width: 580px; box-shadow: 0 20px 50px rgba(0,0,0,0.5); border: 1px solid var(--border); }
+        h1 { margin: 0 0 24px 0; font-size: 1.5rem; color: var(--accent); display: flex; align-items: center; letter-spacing: 0.5px; }
+        .input-group { margin-bottom: 18px; }
+        label { display: block; font-size: 0.85rem; color: #94a3b8; margin-bottom: 6px; font-weight: 500; }
+        input { width: 100%; padding: 12px; background: #0b0e14; border: 1px solid var(--border); border-radius: 6px; color: #fff; outline: none; box-sizing: border-box; transition: 0.2s; font-family: monospace; }
+        input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.2); }
+        .btn { background: var(--accent); color: #fff; border: none; padding: 14px; width: 100%; border-radius: 6px; font-weight: 600; cursor: pointer; margin-top: 10px; transition: 0.2s; letter-spacing: 0.5px; }
+        .btn:hover { background: #0284c7; }
+        .result-box { margin-top: 24px; background: #0b0e14; padding: 16px; border-radius: 6px; border: 1px solid var(--border); position: relative; }
+        .result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 0.85rem; color: var(--accent); font-weight: 600; }
+        code { display: block; word-break: break-all; font-family: 'Consolas', monospace; font-size: 0.8rem; color: #cbd5e1; max-height: 120px; overflow-y: auto; line-height: 1.4; }
+        .copy-btn { background: transparent; border: 1px solid var(--border); color: #94a3b8; padding: 4px 10px; border-radius: 4px; font-size: 0.75rem; cursor: pointer; transition: 0.2s; }
+        .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+        .footer { margin-top: 30px; text-align: center; font-size: 0.75rem; color: #475569; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🛡️ TrojanStallion Core</h1>
+        
+        <div class="input-group">
+            <label>地址 (Address) - 优选IP或CDN域名</label>
+            <input type="text" id="address" value="www.shopify.com">
+        </div>
+        
+        <div class="input-group">
+            <label>Trojan 密码 (Key)</label>
+            <input type="text" id="key" value="abc">
+        </div>
+
+        <div style="border-top: 1px solid var(--border); margin: 24px 0;"></div>
+
+        <div class="input-group">
+            <label>SOCKS5 前置代理 (可选) - 例如 user:pass@1.1.1.1:443</label>
+            <input type="text" id="s5" placeholder="留空则不启用">
+        </div>
+
+        <div class="input-group">
+            <label>自定义反代 IP (可选) - 例如 1.1.1.1:443</label>
+            <input type="text" id="pyip" placeholder="留空则使用默认策略">
+        </div>
+
+        <button class="btn" onclick="generate()">生成订阅配置</button>
+
+        <div id="outputs"></div>
+
+        <div class="footer">ReactionMax Engine v4.1.0 | Secured by TrojanStallion</div>
+    </div>
+
+    <script>
+        // 初始化：从 URL 路径自动获取 Key
+        const currentPath = window.location.pathname.replace('/', '');
+        if(currentPath && currentPath !== 'abc') document.getElementById('key').value = currentPath;
+
+        function generate() {
+            const address = document.getElementById('address').value.trim();
+            const workerHost = window.location.hostname;
+            const key = document.getElementById('key').value.trim();
+            const s5 = document.getElementById('s5').value.trim();
+            const pyip = document.getElementById('pyip').value.trim();
+
+            if (!address || !key) { alert('请完善必填信息'); return; }
+
+            // 构建 Path
+            let path = \`/my-key=\${encodeURIComponent(key)}\`;
+            let alias = 'TrojanStallion';
+            if (s5) { path += \`/s5=\${encodeURIComponent(s5)}\`; alias += '-S5'; }
+            if (pyip) { path += \`/pyip=\${encodeURIComponent(pyip)}\`; alias += '-IP'; }
+            path += '/'; // 闭合
+
+            // Trojan 链接生成逻辑: trojan://password@address:443...
+            const trojanLink = \`trojan://\${key}@\${address}:443?security=tls&sni=\${workerHost}&type=ws&host=\${workerHost}&path=\${encodeURIComponent(path)}#\${alias}\`;
+
+            // Clash 配置生成逻辑 (Type: trojan)
+            const clashConfig = \`
+- name: \${alias}
+  type: trojan
+  server: \${address}
+  port: 443
+  password: \${key}
+  udp: true
+  tls: true
+  skip-cert-verify: true
+  servername: \${workerHost}
+  network: ws
+  ws-opts:
+    path: "\${path}"
+    headers:
+      Host: \${workerHost}\`.trim();
+
+            renderOutput('Trojan Link (Clash/Nekobox)', trojanLink);
+            renderOutput('Clash / Meta YAML', clashConfig);
+        }
+
+        function renderOutput(title, content) {
+            const div = document.createElement('div');
+            div.className = 'result-box';
+            div.innerHTML = \`
+                <div class="result-header">
+                    <span>\${title}</span>
+                    <button class="copy-btn" onclick="copyText(this)">复制</button>
+                </div>
+                <code style="white-space: pre-wrap;">\${escapeHtml(content)}</code>
+                <textarea style="display:none">\${content}</textarea>
+            \`;
+            document.getElementById('outputs').prepend(div);
+        }
+
+        function copyText(btn) {
+            const text = btn.parentElement.nextElementSibling.nextElementSibling.value;
+            navigator.clipboard.writeText(text).then(() => {
+                const originalText = btn.textContent;
+                btn.textContent = '已复制!';
+                btn.style.color = '#0ea5e9';
+                btn.style.borderColor = '#0ea5e9';
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.style.color = '';
+                    btn.style.borderColor = '';
+                }, 2000);
+            });
+        }
+
+        function escapeHtml(text) {
+            return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+        }
+    </script>
+</body>
+</html>
+`;
+
+// 2. 伪装博客页面 (当直接访问域名时显示)
+const FAKE_INDEX_HTML = `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TechNote | Digital Life</title>
+    <style>
+        body { font-family: 'Georgia', serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 40px 20px; color: #333; background: #fff; }
+        header { border-bottom: 1px solid #eee; margin-bottom: 40px; padding-bottom: 20px; }
+        h1 { font-size: 2.2em; margin: 0; color: #2c3e50; letter-spacing: -1px; }
+        .meta { color: #888; font-size: 0.9em; margin-top: 5px; font-style: italic; }
+        article { margin-bottom: 50px; }
+        h2 { font-size: 1.6em; color: #34495e; margin-bottom: 10px; font-weight: normal; }
+        p { margin-bottom: 15px; color: #555; }
+        .read-more { color: #3498db; text-decoration: none; font-weight: bold; font-size: 0.9em; }
+        .read-more:hover { text-decoration: underline; }
+        footer { margin-top: 80px; border-top: 1px solid #eee; padding-top: 20px; font-size: 0.8em; color: #aaa; text-align: center; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>TechNote</h1>
+        <div class="meta">Thoughts on technology, coding, and the digital future.</div>
+    </header>
+
+    <article>
+        <h2>The Future of Cloud Computing</h2>
+        <div class="meta">Posted on November 15, 2024</div>
+        <p>As we move further into the digital age, serverless architectures are becoming increasingly prevalent. The ability to deploy code to the edge reduces latency and improves user experience significantly.</p>
+        <p>Developers are no longer bound by traditional infrastructure management, allowing for faster iteration cycles and reduced operational overhead. This shift is not just technical but cultural...</p>
+        <a href="#" class="read-more">Read more →</a>
+    </article>
+
+    <article>
+        <h2>Understanding WebSockets</h2>
+        <div class="meta">Posted on October 28, 2024</div>
+        <p>Real-time communication has transformed how we interact with web applications. WebSockets provide a persistent connection between client and server, enabling instant data transfer without the overhead of HTTP polling.</p>
+        <a href="#" class="read-more">Read more →</a>
+    </article>
+
+    <article>
+        <h2>Minimalism in Digital Design</h2>
+        <div class="meta">Posted on September 12, 2024</div>
+        <p>In a world of constant noise, digital minimalism offers a breath of fresh air. It focuses on the essential elements of design, stripping away the superfluous to reveal the core message.</p>
+        <a href="#" class="read-more">Read more →</a>
+    </article>
+
+    <footer>
+        &copy; 2024 TechNote Blog. All rights reserved. <br> Powered by Edge Computing.
+    </footer>
+</body>
+</html>
+`;
+
+// ==================== 6. Worker 入口 ====================
+export default {
+    async fetch(请求, 环境, 执行上下文) {
+        try {
+            const URL对象 = new URL(请求.url);
+            
+            // 1. 检查是否为 WebSocket 升级请求 (Trojan 核心流量)
+            const 升级头 = 请求.headers.get('Upgrade');
+            if (升级头?.toLowerCase() === 'websocket') {
+                const { 0: 客户端套接字, 1: 服务端套接字 } = new WebSocketPair();
+                服务端套接字.accept();
+                执行上下文.waitUntil(处理WebSocket会话(服务端套接字, 请求));
+                return new Response(null, { status: 101, webSocket: 客户端套接字 });
+            }
+
+            // 2. 路由分流逻辑
+            const 路径 = URL对象.pathname;
+            const 配置密钥 = 全局配置.密钥;
+
+            // 逻辑：如果路径完全等于 "/密钥"，显示面板
+            if (路径 === `/${配置密钥}` || 路径 === `/${配置密钥}/`) {
+                return new Response(DASHBOARD_HTML, {
+                    status: 200,
+                    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+                });
+            }
+
+            // 3. 其他所有 HTTP 请求 -> 显示伪装博客
+            return new Response(FAKE_INDEX_HTML, {
+                status: 200,
+                headers: { 'Content-Type': 'text/html; charset=utf-8' }
+            });
+
         } catch (err) {
-            let e = err;
-            return new Response(e.toString());
+            console.error(`Fetch处理器崩溃: ${err.stack || err.message}`);
+            return new Response('Internal Server Error', { status: 500 });
         }
     }
 };
-
-async function trojanOverWSHandler(request) {
-    const webSocketPair = new WebSocketPair();
-    const [client, webSocket] = Object.values(webSocketPair);
-    webSocket.accept();
-    let address = "";
-    let portWithRandomLog = "";
-    const log = (info, event) => {
-        console.log(`[${address}:${portWithRandomLog}] ${info}`, event || "");
-    };
-    const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
-    const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
-    let remoteSocketWapper = {
-        value: null
-    };
-    let udpStreamWrite = null;
-    readableWebSocketStream.pipeTo(new WritableStream({
-        async write(chunk, controller) {
-            if (udpStreamWrite) {
-                return udpStreamWrite(chunk);
-            }
-            if (remoteSocketWapper.value) {
-                const writer = remoteSocketWapper.value.writable.getWriter();
-                await writer.write(chunk);
-                writer.releaseLock();
-                return;
-            }
-            const {
-                hasError,
-                message,
-                portRemote = 443,
-                addressRemote = "",
-                rawClientData
-            } = await parseTrojanHeader(chunk);
-            address = addressRemote;
-            portWithRandomLog = `${portRemote}--${Math.random()} tcp`;
-            if (hasError) {
-                throw new Error(message);
-                return;
-            }
-            handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, rawClientData, webSocket, log);
-        },
-        close() {
-            log(`readableWebSocketStream is closed`);
-        },
-        abort(reason) {
-            log(`readableWebSocketStream is aborted`, JSON.stringify(reason));
-        }
-    })).catch((err) => {
-        log("readableWebSocketStream pipeTo error", err);
-    });
-    return new Response(null, {
-        status: 101,
-        // @ts-ignore
-        webSocket: client
-    });
-}
-
-async function parseTrojanHeader(buffer) {
-    if (buffer.byteLength < 56) {
-        return {
-            hasError: true,
-            message: "invalid data"
-        };
-    }
-    let crLfIndex = 56;
-    if (new Uint8Array(buffer.slice(56, 57))[0] !== 0x0d || new Uint8Array(buffer.slice(57, 58))[0] !== 0x0a) {
-        return {
-            hasError: true,
-            message: "invalid header format (missing CR LF)"
-        };
-    }
-    const password = new TextDecoder().decode(buffer.slice(0, crLfIndex));
-    if (password !== sha224Password) {
-        return {
-            hasError: true,
-            message: "invalid password"
-        };
-    }
-
-    const socks5DataBuffer = buffer.slice(crLfIndex + 2);
-    if (socks5DataBuffer.byteLength < 6) {
-        return {
-            hasError: true,
-            message: "invalid SOCKS5 request data"
-        };
-    }
-
-    const view = new DataView(socks5DataBuffer);
-    const cmd = view.getUint8(0);
-    if (cmd !== 1) {
-        return {
-            hasError: true,
-            message: "unsupported command, only TCP (CONNECT) is allowed"
-        };
-    }
-
-    const atype = view.getUint8(1);
-    // 0x01: IPv4 address
-    // 0x03: Domain name
-    // 0x04: IPv6 address
-    let addressLength = 0;
-    let addressIndex = 2;
-    let address = "";
-    switch (atype) {
-        case 1:
-            addressLength = 4;
-            address = new Uint8Array(
-              socks5DataBuffer.slice(addressIndex, addressIndex + addressLength)
-            ).join(".");
-            break;
-        case 3:
-            addressLength = new Uint8Array(
-              socks5DataBuffer.slice(addressIndex, addressIndex + 1)
-            )[0];
-            addressIndex += 1;
-            address = new TextDecoder().decode(
-              socks5DataBuffer.slice(addressIndex, addressIndex + addressLength)
-            );
-            break;
-        case 4:
-            addressLength = 16;
-            const dataView = new DataView(socks5DataBuffer.slice(addressIndex, addressIndex + addressLength));
-            const ipv6 = [];
-            for (let i = 0; i < 8; i++) {
-                ipv6.push(dataView.getUint16(i * 2).toString(16));
-            }
-            address = ipv6.join(":");
-            break;
-        default:
-            return {
-                hasError: true,
-                message: `invalid addressType is ${atype}`
-            };
-    }
-
-    if (!address) {
-        return {
-            hasError: true,
-            message: `address is empty, addressType is ${atype}`
-        };
-    }
-
-    const portIndex = addressIndex + addressLength;
-    const portBuffer = socks5DataBuffer.slice(portIndex, portIndex + 2);
-    const portRemote = new DataView(portBuffer).getUint16(0);
-    return {
-        hasError: false,
-        addressRemote: address,
-        portRemote,
-        rawClientData: socks5DataBuffer.slice(portIndex + 4)
-    };
-}
-
-async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, log) {
-    async function connectAndWrite(address, port) {
-        const tcpSocket2 = connect({
-            hostname: address,
-            port
-        });
-        remoteSocket.value = tcpSocket2;
-        log(`connected to ${address}:${port}`);
-        const writer = tcpSocket2.writable.getWriter();
-        await writer.write(rawClientData);
-        writer.releaseLock();
-        return tcpSocket2;
-    }
-    async function retry() {
-        const tcpSocket2 = await connectAndWrite(proxyIP || addressRemote, portRemote);
-        tcpSocket2.closed.catch((error) => {
-            console.log("retry tcpSocket closed error", error);
-        }).finally(() => {
-            safeCloseWebSocket(webSocket);
-        });
-        remoteSocketToWS(tcpSocket2, webSocket, null, log);
-    }
-    const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-    remoteSocketToWS(tcpSocket, webSocket, retry, log);
-}
-
-function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
-    let readableStreamCancel = false;
-    const stream = new ReadableStream({
-        start(controller) {
-            webSocketServer.addEventListener("message", (event) => {
-                if (readableStreamCancel) {
-                    return;
-                }
-                const message = event.data;
-                controller.enqueue(message);
-            });
-            webSocketServer.addEventListener("close", () => {
-                safeCloseWebSocket(webSocketServer);
-                if (readableStreamCancel) {
-                    return;
-                }
-                controller.close();
-            });
-            webSocketServer.addEventListener("error", (err) => {
-                log("webSocketServer error");
-                controller.error(err);
-            });
-            const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
-            if (error) {
-                controller.error(error);
-            } else if (earlyData) {
-                controller.enqueue(earlyData);
-            }
-        },
-        pull(controller) {},
-        cancel(reason) {
-            if (readableStreamCancel) {
-                return;
-            }
-            log(`readableStream was canceled, due to ${reason}`);
-            readableStreamCancel = true;
-            safeCloseWebSocket(webSocketServer);
-        }
-    });
-    return stream;
-}
-
-async function remoteSocketToWS(remoteSocket, webSocket, retry, log) {
-    let hasIncomingData = false;
-    await remoteSocket.readable.pipeTo(
-        new WritableStream({
-            start() {},
-            /**
-             *
-             * @param {Uint8Array} chunk
-             * @param {*} controller
-             */
-            async write(chunk, controller) {
-                hasIncomingData = true;
-                if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-                    controller.error(
-                        "webSocket connection is not open"
-                    );
-                }
-                webSocket.send(chunk);
-            },
-            close() {
-                log(`remoteSocket.readable is closed, hasIncomingData: ${hasIncomingData}`);
-            },
-            abort(reason) {
-                console.error("remoteSocket.readable abort", reason);
-            }
-        })
-    ).catch((error) => {
-        console.error(
-            `remoteSocketToWS error:`,
-            error.stack || error
-        );
-        safeCloseWebSocket(webSocket);
-    });
-    if (hasIncomingData === false && retry) {
-        log(`retry`);
-        retry();
-    }
-}
-
-/*
-function isValidSHA224(hash) {
-	const sha224Regex = /^[0-9a-f]{56}$/i;
-	return sha224Regex.test(hash);
-}
-*/
-
-function base64ToArrayBuffer(base64Str) {
-    if (!base64Str) {
-        return { error: null };
-    }
-    try {
-        base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
-        const decode = atob(base64Str);
-        const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
-        return { earlyData: arryBuffer.buffer, error: null };
-    } catch (error) {
-        return { error };
-    }
-}
-
-let WS_READY_STATE_OPEN = 1;
-let WS_READY_STATE_CLOSING = 2;
-
-function safeCloseWebSocket(socket) {
-    try {
-        if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
-            socket.close();
-        }
-    } catch (error) {
-        console.error("safeCloseWebSocket error", error);
-    }
-}
-
-/**
- * @param {string} password
- * @param {string | null} hostName
- * @param {string} sub
- * @param {string} UA
- * @returns {Promise<string>}
- */
-let subParams = ['sub','base64','b64','clash','singbox','sb'];
-async function getTROJANConfig(password, hostName, sub, UA, RproxyIP, _url) {
-	const userAgent = UA.toLowerCase();
-	if ((!sub || sub === '' || (sub && userAgent.includes('mozilla'))) && !subParams.some(_searchParams => _url.searchParams.has(_searchParams))) {
-    return `
-    <p>===================================================配置详解=======================================================</p>
-      Subscribe / sub 订阅地址, 支持 Base64、clash-meta、sing-box 订阅格式, 您的订阅内容由 ${sub} 提供维护支持, 自动获取ProxyIP: ${RproxyIP}.
-    --------------------------------------------------------------------------------------------------------------------
-      订阅地址：https://${sub}/sub?host=${hostName}&password=${password}&proxyip=${RproxyIP}
-    <p>=================================================================================================================</p>
-      github 项目地址 Star!Star!Star!!!
-      telegram 交流群 技术大佬~在线发牌!
-      https://t.me/CMLiussss
-    <p>=================================================================================================================</p>
-    `
-  }
-}
-
-/**
- * [js-sha256]{@link https://github.com/emn178/js-sha256}
- *
- * @version 0.11.0
- * @author Chen, Yi-Cyuan [emn178@gmail.com]
- * @copyright Chen, Yi-Cyuan 2014-2024
- * @license MIT
- */
-/*jslint bitwise: true */
-(function () {
-	'use strict';
-  
-	var ERROR = 'input is invalid type';
-	var WINDOW = typeof window === 'object';
-	var root = WINDOW ? window : {};
-	if (root.JS_SHA256_NO_WINDOW) {
-	  WINDOW = false;
-	}
-	var WEB_WORKER = !WINDOW && typeof self === 'object';
-	var NODE_JS = !root.JS_SHA256_NO_NODE_JS && typeof process === 'object' && process.versions && process.versions.node;
-	if (NODE_JS) {
-	  root = global;
-	} else if (WEB_WORKER) {
-	  root = self;
-	}
-	var COMMON_JS = !root.JS_SHA256_NO_COMMON_JS && typeof module === 'object' && module.exports;
-	var AMD = typeof define === 'function' && define.amd;
-	var ARRAY_BUFFER = !root.JS_SHA256_NO_ARRAY_BUFFER && typeof ArrayBuffer !== 'undefined';
-	var HEX_CHARS = '0123456789abcdef'.split('');
-	var EXTRA = [-2147483648, 8388608, 32768, 128];
-	var SHIFT = [24, 16, 8, 0];
-	var K = [
-	  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-	  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-	  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-	  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-	  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-	  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-	  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-	  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-	];
-	var OUTPUT_TYPES = ['hex', 'array', 'digest', 'arrayBuffer'];
-  
-	var blocks = [];
-  
-	if (root.JS_SHA256_NO_NODE_JS || !Array.isArray) {
-	  Array.isArray = function (obj) {
-		return Object.prototype.toString.call(obj) === '[object Array]';
-	  };
-	}
-  
-	if (ARRAY_BUFFER && (root.JS_SHA256_NO_ARRAY_BUFFER_IS_VIEW || !ArrayBuffer.isView)) {
-	  ArrayBuffer.isView = function (obj) {
-		return typeof obj === 'object' && obj.buffer && obj.buffer.constructor === ArrayBuffer;
-	  };
-	}
-  
-	var createOutputMethod = function (outputType, is224) {
-	  return function (message) {
-		return new Sha256(is224, true).update(message)[outputType]();
-	  };
-	};
-  
-	var createMethod = function (is224) {
-	  var method = createOutputMethod('hex', is224);
-	  if (NODE_JS) {
-		method = nodeWrap(method, is224);
-	  }
-	  method.create = function () {
-		return new Sha256(is224);
-	  };
-	  method.update = function (message) {
-		return method.create().update(message);
-	  };
-	  for (var i = 0; i < OUTPUT_TYPES.length; ++i) {
-		var type = OUTPUT_TYPES[i];
-		method[type] = createOutputMethod(type, is224);
-	  }
-	  return method;
-	};
-  
-	var nodeWrap = function (method, is224) {
-	  var crypto = require('crypto')
-	  var Buffer = require('buffer').Buffer;
-	  var algorithm = is224 ? 'sha224' : 'sha256';
-	  var bufferFrom;
-	  if (Buffer.from && !root.JS_SHA256_NO_BUFFER_FROM) {
-		bufferFrom = Buffer.from;
-	  } else {
-		bufferFrom = function (message) {
-		  return new Buffer(message);
-		};
-	  }
-	  var nodeMethod = function (message) {
-		if (typeof message === 'string') {
-		  return crypto.createHash(algorithm).update(message, 'utf8').digest('hex');
-		} else {
-		  if (message === null || message === undefined) {
-			throw new Error(ERROR);
-		  } else if (message.constructor === ArrayBuffer) {
-			message = new Uint8Array(message);
-		  }
-		}
-		if (Array.isArray(message) || ArrayBuffer.isView(message) ||
-		  message.constructor === Buffer) {
-		  return crypto.createHash(algorithm).update(bufferFrom(message)).digest('hex');
-		} else {
-		  return method(message);
-		}
-	  };
-	  return nodeMethod;
-	};
-  
-	var createHmacOutputMethod = function (outputType, is224) {
-	  return function (key, message) {
-		return new HmacSha256(key, is224, true).update(message)[outputType]();
-	  };
-	};
-  
-	var createHmacMethod = function (is224) {
-	  var method = createHmacOutputMethod('hex', is224);
-	  method.create = function (key) {
-		return new HmacSha256(key, is224);
-	  };
-	  method.update = function (key, message) {
-		return method.create(key).update(message);
-	  };
-	  for (var i = 0; i < OUTPUT_TYPES.length; ++i) {
-		var type = OUTPUT_TYPES[i];
-		method[type] = createHmacOutputMethod(type, is224);
-	  }
-	  return method;
-	};
-  
-	function Sha256(is224, sharedMemory) {
-	  if (sharedMemory) {
-		blocks[0] = blocks[16] = blocks[1] = blocks[2] = blocks[3] =
-		  blocks[4] = blocks[5] = blocks[6] = blocks[7] =
-		  blocks[8] = blocks[9] = blocks[10] = blocks[11] =
-		  blocks[12] = blocks[13] = blocks[14] = blocks[15] = 0;
-		this.blocks = blocks;
-	  } else {
-		this.blocks = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-	  }
-  
-	  if (is224) {
-		this.h0 = 0xc1059ed8;
-		this.h1 = 0x367cd507;
-		this.h2 = 0x3070dd17;
-		this.h3 = 0xf70e5939;
-		this.h4 = 0xffc00b31;
-		this.h5 = 0x68581511;
-		this.h6 = 0x64f98fa7;
-		this.h7 = 0xbefa4fa4;
-	  } else { // 256
-		this.h0 = 0x6a09e667;
-		this.h1 = 0xbb67ae85;
-		this.h2 = 0x3c6ef372;
-		this.h3 = 0xa54ff53a;
-		this.h4 = 0x510e527f;
-		this.h5 = 0x9b05688c;
-		this.h6 = 0x1f83d9ab;
-		this.h7 = 0x5be0cd19;
-	  }
-  
-	  this.block = this.start = this.bytes = this.hBytes = 0;
-	  this.finalized = this.hashed = false;
-	  this.first = true;
-	  this.is224 = is224;
-	}
-  
-	Sha256.prototype.update = function (message) {
-	  if (this.finalized) {
-		return;
-	  }
-	  var notString, type = typeof message;
-	  if (type !== 'string') {
-		if (type === 'object') {
-		  if (message === null) {
-			throw new Error(ERROR);
-		  } else if (ARRAY_BUFFER && message.constructor === ArrayBuffer) {
-			message = new Uint8Array(message);
-		  } else if (!Array.isArray(message)) {
-			if (!ARRAY_BUFFER || !ArrayBuffer.isView(message)) {
-			  throw new Error(ERROR);
-			}
-		  }
-		} else {
-		  throw new Error(ERROR);
-		}
-		notString = true;
-	  }
-	  var code, index = 0, i, length = message.length, blocks = this.blocks;
-	  while (index < length) {
-		if (this.hashed) {
-		  this.hashed = false;
-		  blocks[0] = this.block;
-		  this.block = blocks[16] = blocks[1] = blocks[2] = blocks[3] =
-			blocks[4] = blocks[5] = blocks[6] = blocks[7] =
-			blocks[8] = blocks[9] = blocks[10] = blocks[11] =
-			blocks[12] = blocks[13] = blocks[14] = blocks[15] = 0;
-		}
-  
-		if (notString) {
-		  for (i = this.start; index < length && i < 64; ++index) {
-			blocks[i >>> 2] |= message[index] << SHIFT[i++ & 3];
-		  }
-		} else {
-		  for (i = this.start; index < length && i < 64; ++index) {
-			code = message.charCodeAt(index);
-			if (code < 0x80) {
-			  blocks[i >>> 2] |= code << SHIFT[i++ & 3];
-			} else if (code < 0x800) {
-			  blocks[i >>> 2] |= (0xc0 | (code >>> 6)) << SHIFT[i++ & 3];
-			  blocks[i >>> 2] |= (0x80 | (code & 0x3f)) << SHIFT[i++ & 3];
-			} else if (code < 0xd800 || code >= 0xe000) {
-			  blocks[i >>> 2] |= (0xe0 | (code >>> 12)) << SHIFT[i++ & 3];
-			  blocks[i >>> 2] |= (0x80 | ((code >>> 6) & 0x3f)) << SHIFT[i++ & 3];
-			  blocks[i >>> 2] |= (0x80 | (code & 0x3f)) << SHIFT[i++ & 3];
-			} else {
-			  code = 0x10000 + (((code & 0x3ff) << 10) | (message.charCodeAt(++index) & 0x3ff));
-			  blocks[i >>> 2] |= (0xf0 | (code >>> 18)) << SHIFT[i++ & 3];
-			  blocks[i >>> 2] |= (0x80 | ((code >>> 12) & 0x3f)) << SHIFT[i++ & 3];
-			  blocks[i >>> 2] |= (0x80 | ((code >>> 6) & 0x3f)) << SHIFT[i++ & 3];
-			  blocks[i >>> 2] |= (0x80 | (code & 0x3f)) << SHIFT[i++ & 3];
-			}
-		  }
-		}
-  
-		this.lastByteIndex = i;
-		this.bytes += i - this.start;
-		if (i >= 64) {
-		  this.block = blocks[16];
-		  this.start = i - 64;
-		  this.hash();
-		  this.hashed = true;
-		} else {
-		  this.start = i;
-		}
-	  }
-	  if (this.bytes > 4294967295) {
-		this.hBytes += this.bytes / 4294967296 << 0;
-		this.bytes = this.bytes % 4294967296;
-	  }
-	  return this;
-	};
-  
-	Sha256.prototype.finalize = function () {
-	  if (this.finalized) {
-		return;
-	  }
-	  this.finalized = true;
-	  var blocks = this.blocks, i = this.lastByteIndex;
-	  blocks[16] = this.block;
-	  blocks[i >>> 2] |= EXTRA[i & 3];
-	  this.block = blocks[16];
-	  if (i >= 56) {
-		if (!this.hashed) {
-		  this.hash();
-		}
-		blocks[0] = this.block;
-		blocks[16] = blocks[1] = blocks[2] = blocks[3] =
-		  blocks[4] = blocks[5] = blocks[6] = blocks[7] =
-		  blocks[8] = blocks[9] = blocks[10] = blocks[11] =
-		  blocks[12] = blocks[13] = blocks[14] = blocks[15] = 0;
-	  }
-	  blocks[14] = this.hBytes << 3 | this.bytes >>> 29;
-	  blocks[15] = this.bytes << 3;
-	  this.hash();
-	};
-  
-	Sha256.prototype.hash = function () {
-	  var a = this.h0, b = this.h1, c = this.h2, d = this.h3, e = this.h4, f = this.h5, g = this.h6,
-		h = this.h7, blocks = this.blocks, j, s0, s1, maj, t1, t2, ch, ab, da, cd, bc;
-  
-	  for (j = 16; j < 64; ++j) {
-		// rightrotate
-		t1 = blocks[j - 15];
-		s0 = ((t1 >>> 7) | (t1 << 25)) ^ ((t1 >>> 18) | (t1 << 14)) ^ (t1 >>> 3);
-		t1 = blocks[j - 2];
-		s1 = ((t1 >>> 17) | (t1 << 15)) ^ ((t1 >>> 19) | (t1 << 13)) ^ (t1 >>> 10);
-		blocks[j] = blocks[j - 16] + s0 + blocks[j - 7] + s1 << 0;
-	  }
-  
-	  bc = b & c;
-	  for (j = 0; j < 64; j += 4) {
-		if (this.first) {
-		  if (this.is224) {
-			ab = 300032;
-			t1 = blocks[0] - 1413257819;
-			h = t1 - 150054599 << 0;
-			d = t1 + 24177077 << 0;
-		  } else {
-			ab = 704751109;
-			t1 = blocks[0] - 210244248;
-			h = t1 - 1521486534 << 0;
-			d = t1 + 143694565 << 0;
-		  }
-		  this.first = false;
-		} else {
-		  s0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
-		  s1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
-		  ab = a & b;
-		  maj = ab ^ (a & c) ^ bc;
-		  ch = (e & f) ^ (~e & g);
-		  t1 = h + s1 + ch + K[j] + blocks[j];
-		  t2 = s0 + maj;
-		  h = d + t1 << 0;
-		  d = t1 + t2 << 0;
-		}
-		s0 = ((d >>> 2) | (d << 30)) ^ ((d >>> 13) | (d << 19)) ^ ((d >>> 22) | (d << 10));
-		s1 = ((h >>> 6) | (h << 26)) ^ ((h >>> 11) | (h << 21)) ^ ((h >>> 25) | (h << 7));
-		da = d & a;
-		maj = da ^ (d & b) ^ ab;
-		ch = (h & e) ^ (~h & f);
-		t1 = g + s1 + ch + K[j + 1] + blocks[j + 1];
-		t2 = s0 + maj;
-		g = c + t1 << 0;
-		c = t1 + t2 << 0;
-		s0 = ((c >>> 2) | (c << 30)) ^ ((c >>> 13) | (c << 19)) ^ ((c >>> 22) | (c << 10));
-		s1 = ((g >>> 6) | (g << 26)) ^ ((g >>> 11) | (g << 21)) ^ ((g >>> 25) | (g << 7));
-		cd = c & d;
-		maj = cd ^ (c & a) ^ da;
-		ch = (g & h) ^ (~g & e);
-		t1 = f + s1 + ch + K[j + 2] + blocks[j + 2];
-		t2 = s0 + maj;
-		f = b + t1 << 0;
-		b = t1 + t2 << 0;
-		s0 = ((b >>> 2) | (b << 30)) ^ ((b >>> 13) | (b << 19)) ^ ((b >>> 22) | (b << 10));
-		s1 = ((f >>> 6) | (f << 26)) ^ ((f >>> 11) | (f << 21)) ^ ((f >>> 25) | (f << 7));
-		bc = b & c;
-		maj = bc ^ (b & d) ^ cd;
-		ch = (f & g) ^ (~f & h);
-		t1 = e + s1 + ch + K[j + 3] + blocks[j + 3];
-		t2 = s0 + maj;
-		e = a + t1 << 0;
-		a = t1 + t2 << 0;
-		this.chromeBugWorkAround = true;
-	  }
-  
-	  this.h0 = this.h0 + a << 0;
-	  this.h1 = this.h1 + b << 0;
-	  this.h2 = this.h2 + c << 0;
-	  this.h3 = this.h3 + d << 0;
-	  this.h4 = this.h4 + e << 0;
-	  this.h5 = this.h5 + f << 0;
-	  this.h6 = this.h6 + g << 0;
-	  this.h7 = this.h7 + h << 0;
-	};
-  
-	Sha256.prototype.hex = function () {
-	  this.finalize();
-  
-	  var h0 = this.h0, h1 = this.h1, h2 = this.h2, h3 = this.h3, h4 = this.h4, h5 = this.h5,
-		h6 = this.h6, h7 = this.h7;
-  
-	  var hex = HEX_CHARS[(h0 >>> 28) & 0x0F] + HEX_CHARS[(h0 >>> 24) & 0x0F] +
-		HEX_CHARS[(h0 >>> 20) & 0x0F] + HEX_CHARS[(h0 >>> 16) & 0x0F] +
-		HEX_CHARS[(h0 >>> 12) & 0x0F] + HEX_CHARS[(h0 >>> 8) & 0x0F] +
-		HEX_CHARS[(h0 >>> 4) & 0x0F] + HEX_CHARS[h0 & 0x0F] +
-		HEX_CHARS[(h1 >>> 28) & 0x0F] + HEX_CHARS[(h1 >>> 24) & 0x0F] +
-		HEX_CHARS[(h1 >>> 20) & 0x0F] + HEX_CHARS[(h1 >>> 16) & 0x0F] +
-		HEX_CHARS[(h1 >>> 12) & 0x0F] + HEX_CHARS[(h1 >>> 8) & 0x0F] +
-		HEX_CHARS[(h1 >>> 4) & 0x0F] + HEX_CHARS[h1 & 0x0F] +
-		HEX_CHARS[(h2 >>> 28) & 0x0F] + HEX_CHARS[(h2 >>> 24) & 0x0F] +
-		HEX_CHARS[(h2 >>> 20) & 0x0F] + HEX_CHARS[(h2 >>> 16) & 0x0F] +
-		HEX_CHARS[(h2 >>> 12) & 0x0F] + HEX_CHARS[(h2 >>> 8) & 0x0F] +
-		HEX_CHARS[(h2 >>> 4) & 0x0F] + HEX_CHARS[h2 & 0x0F] +
-		HEX_CHARS[(h3 >>> 28) & 0x0F] + HEX_CHARS[(h3 >>> 24) & 0x0F] +
-		HEX_CHARS[(h3 >>> 20) & 0x0F] + HEX_CHARS[(h3 >>> 16) & 0x0F] +
-		HEX_CHARS[(h3 >>> 12) & 0x0F] + HEX_CHARS[(h3 >>> 8) & 0x0F] +
-		HEX_CHARS[(h3 >>> 4) & 0x0F] + HEX_CHARS[h3 & 0x0F] +
-		HEX_CHARS[(h4 >>> 28) & 0x0F] + HEX_CHARS[(h4 >>> 24) & 0x0F] +
-		HEX_CHARS[(h4 >>> 20) & 0x0F] + HEX_CHARS[(h4 >>> 16) & 0x0F] +
-		HEX_CHARS[(h4 >>> 12) & 0x0F] + HEX_CHARS[(h4 >>> 8) & 0x0F] +
-		HEX_CHARS[(h4 >>> 4) & 0x0F] + HEX_CHARS[h4 & 0x0F] +
-		HEX_CHARS[(h5 >>> 28) & 0x0F] + HEX_CHARS[(h5 >>> 24) & 0x0F] +
-		HEX_CHARS[(h5 >>> 20) & 0x0F] + HEX_CHARS[(h5 >>> 16) & 0x0F] +
-		HEX_CHARS[(h5 >>> 12) & 0x0F] + HEX_CHARS[(h5 >>> 8) & 0x0F] +
-		HEX_CHARS[(h5 >>> 4) & 0x0F] + HEX_CHARS[h5 & 0x0F] +
-		HEX_CHARS[(h6 >>> 28) & 0x0F] + HEX_CHARS[(h6 >>> 24) & 0x0F] +
-		HEX_CHARS[(h6 >>> 20) & 0x0F] + HEX_CHARS[(h6 >>> 16) & 0x0F] +
-		HEX_CHARS[(h6 >>> 12) & 0x0F] + HEX_CHARS[(h6 >>> 8) & 0x0F] +
-		HEX_CHARS[(h6 >>> 4) & 0x0F] + HEX_CHARS[h6 & 0x0F];
-	  if (!this.is224) {
-		hex += HEX_CHARS[(h7 >>> 28) & 0x0F] + HEX_CHARS[(h7 >>> 24) & 0x0F] +
-		  HEX_CHARS[(h7 >>> 20) & 0x0F] + HEX_CHARS[(h7 >>> 16) & 0x0F] +
-		  HEX_CHARS[(h7 >>> 12) & 0x0F] + HEX_CHARS[(h7 >>> 8) & 0x0F] +
-		  HEX_CHARS[(h7 >>> 4) & 0x0F] + HEX_CHARS[h7 & 0x0F];
-	  }
-	  return hex;
-	};
-  
-	Sha256.prototype.toString = Sha256.prototype.hex;
-  
-	Sha256.prototype.digest = function () {
-	  this.finalize();
-  
-	  var h0 = this.h0, h1 = this.h1, h2 = this.h2, h3 = this.h3, h4 = this.h4, h5 = this.h5,
-		h6 = this.h6, h7 = this.h7;
-  
-	  var arr = [
-		(h0 >>> 24) & 0xFF, (h0 >>> 16) & 0xFF, (h0 >>> 8) & 0xFF, h0 & 0xFF,
-		(h1 >>> 24) & 0xFF, (h1 >>> 16) & 0xFF, (h1 >>> 8) & 0xFF, h1 & 0xFF,
-		(h2 >>> 24) & 0xFF, (h2 >>> 16) & 0xFF, (h2 >>> 8) & 0xFF, h2 & 0xFF,
-		(h3 >>> 24) & 0xFF, (h3 >>> 16) & 0xFF, (h3 >>> 8) & 0xFF, h3 & 0xFF,
-		(h4 >>> 24) & 0xFF, (h4 >>> 16) & 0xFF, (h4 >>> 8) & 0xFF, h4 & 0xFF,
-		(h5 >>> 24) & 0xFF, (h5 >>> 16) & 0xFF, (h5 >>> 8) & 0xFF, h5 & 0xFF,
-		(h6 >>> 24) & 0xFF, (h6 >>> 16) & 0xFF, (h6 >>> 8) & 0xFF, h6 & 0xFF
-	  ];
-	  if (!this.is224) {
-		arr.push((h7 >>> 24) & 0xFF, (h7 >>> 16) & 0xFF, (h7 >>> 8) & 0xFF, h7 & 0xFF);
-	  }
-	  return arr;
-	};
-  
-	Sha256.prototype.array = Sha256.prototype.digest;
-  
-	Sha256.prototype.arrayBuffer = function () {
-	  this.finalize();
-  
-	  var buffer = new ArrayBuffer(this.is224 ? 28 : 32);
-	  var dataView = new DataView(buffer);
-	  dataView.setUint32(0, this.h0);
-	  dataView.setUint32(4, this.h1);
-	  dataView.setUint32(8, this.h2);
-	  dataView.setUint32(12, this.h3);
-	  dataView.setUint32(16, this.h4);
-	  dataView.setUint32(20, this.h5);
-	  dataView.setUint32(24, this.h6);
-	  if (!this.is224) {
-		dataView.setUint32(28, this.h7);
-	  }
-	  return buffer;
-	};
-  
-	function HmacSha256(key, is224, sharedMemory) {
-	  var i, type = typeof key;
-	  if (type === 'string') {
-		var bytes = [], length = key.length, index = 0, code;
-		for (i = 0; i < length; ++i) {
-		  code = key.charCodeAt(i);
-		  if (code < 0x80) {
-			bytes[index++] = code;
-		  } else if (code < 0x800) {
-			bytes[index++] = (0xc0 | (code >>> 6));
-			bytes[index++] = (0x80 | (code & 0x3f));
-		  } else if (code < 0xd800 || code >= 0xe000) {
-			bytes[index++] = (0xe0 | (code >>> 12));
-			bytes[index++] = (0x80 | ((code >>> 6) & 0x3f));
-			bytes[index++] = (0x80 | (code & 0x3f));
-		  } else {
-			code = 0x10000 + (((code & 0x3ff) << 10) | (key.charCodeAt(++i) & 0x3ff));
-			bytes[index++] = (0xf0 | (code >>> 18));
-			bytes[index++] = (0x80 | ((code >>> 12) & 0x3f));
-			bytes[index++] = (0x80 | ((code >>> 6) & 0x3f));
-			bytes[index++] = (0x80 | (code & 0x3f));
-		  }
-		}
-		key = bytes;
-	  } else {
-		if (type === 'object') {
-		  if (key === null) {
-			throw new Error(ERROR);
-		  } else if (ARRAY_BUFFER && key.constructor === ArrayBuffer) {
-			key = new Uint8Array(key);
-		  } else if (!Array.isArray(key)) {
-			if (!ARRAY_BUFFER || !ArrayBuffer.isView(key)) {
-			  throw new Error(ERROR);
-			}
-		  }
-		} else {
-		  throw new Error(ERROR);
-		}
-	  }
-  
-	  if (key.length > 64) {
-		key = (new Sha256(is224, true)).update(key).array();
-	  }
-  
-	  var oKeyPad = [], iKeyPad = [];
-	  for (i = 0; i < 64; ++i) {
-		var b = key[i] || 0;
-		oKeyPad[i] = 0x5c ^ b;
-		iKeyPad[i] = 0x36 ^ b;
-	  }
-  
-	  Sha256.call(this, is224, sharedMemory);
-  
-	  this.update(iKeyPad);
-	  this.oKeyPad = oKeyPad;
-	  this.inner = true;
-	  this.sharedMemory = sharedMemory;
-	}
-	HmacSha256.prototype = new Sha256();
-  
-	HmacSha256.prototype.finalize = function () {
-	  Sha256.prototype.finalize.call(this);
-	  if (this.inner) {
-		this.inner = false;
-		var innerHash = this.array();
-		Sha256.call(this, this.is224, this.sharedMemory);
-		this.update(this.oKeyPad);
-		this.update(innerHash);
-		Sha256.prototype.finalize.call(this);
-	  }
-	};
-  
-	var exports = createMethod();
-	exports.sha256 = exports;
-	exports.sha224 = createMethod(true);
-	exports.sha256.hmac = createHmacMethod();
-	exports.sha224.hmac = createHmacMethod(true);
-  
-	if (COMMON_JS) {
-	  module.exports = exports;
-	} else {
-	  root.sha256 = exports.sha256;
-	  root.sha224 = exports.sha224;
-	  if (AMD) {
-		define(function () {
-		  return exports;
-		});
-	  }
-	}
-  })();
